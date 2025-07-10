@@ -11,7 +11,7 @@ import asyncio
 import hashlib
 import pickle
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 
@@ -33,7 +33,35 @@ from agent_core.config.analysis_config import AnalysisConfig, AnalysisMode, Conf
 
 logger = logging.getLogger(__name__)
 
+# ===== 查询类型枚举 =====
+
+from enum import Enum
+
+class QueryType(Enum):
+    """查询类型"""
+    GENE = "gene"                    # 基因查询
+    KEYWORD = "keyword"              # 关键词查询
+    PROTEIN_FAMILY = "protein_family" # 蛋白家族查询
+    MECHANISM = "mechanism"          # 机制查询
+    COMPLEX = "complex"              # 复合查询
+
 # ===== 数据结构定义 =====
+
+@dataclass
+class SearchQuery:
+    """搜索查询结构"""
+    query_text: str                 # 查询文本
+    query_type: QueryType           # 查询类型
+    additional_terms: List[str] = None  # 附加术语
+    exclude_terms: List[str] = None     # 排除术语
+    date_range: tuple = None            # 日期范围 (start_year, end_year)
+    max_results: int = 500              # 最大结果数
+    
+    def __post_init__(self):
+        if self.additional_terms is None:
+            self.additional_terms = []
+        if self.exclude_terms is None:
+            self.exclude_terms = []
 
 @dataclass
 class LiteratureDocument:
@@ -85,28 +113,81 @@ class LiteratureAnalysisResult:
 # ===== PubMed检索器 =====
 
 class PubMedRetriever:
-    """PubMed文献检索器"""
+    """PubMed文献检索器 - 支持多种查询类型"""
     
     def __init__(self):
-        self.name = "PubMed Retriever"
-        self.version = "2.0.0"
+        self.name = "Enhanced PubMed Retriever"
+        self.version = "3.0.0"
         # 配置Bio.Entrez
         Entrez.email = "czqrainy@gmail.com"
         Entrez.api_key = "983222f9d5a2a81facd7d158791d933e6408"
+        
+        # 预定义的搜索模板
+        self.search_templates = {
+            QueryType.GENE: [
+                "{query}[Title/Abstract]",
+                '"{query}" AND (disease OR treatment OR therapy)',
+                "{query} AND (clinical trial[Publication Type] OR clinical study[Publication Type])",
+                "{query} AND (mechanism OR pathway OR function)",
+                "{query} AND (drug OR inhibitor OR target OR therapeutic)"
+            ],
+            QueryType.KEYWORD: [
+                "{query}[Title/Abstract]",
+                '"{query}" AND (regulation OR expression OR function)',
+                "{query} AND (signaling OR pathway OR mechanism)",
+                "{query} AND (therapeutic OR treatment OR clinical)",
+                "{query} AND (protein OR gene OR molecular)"
+            ],
+            QueryType.PROTEIN_FAMILY: [
+                '"{query}" AND (protein OR family OR domain)',
+                "{query} AND (structure OR function OR binding)",
+                "{query} AND (regulation OR expression OR localization)",
+                "{query} AND (interaction OR complex OR assembly)",
+                "{query} AND (evolution OR conservation OR phylogeny)"
+            ],
+            QueryType.MECHANISM: [
+                '"{query}" AND (mechanism OR pathway OR process)',
+                "{query} AND (regulation OR control OR modulation)",
+                "{query} AND (signaling OR cascade OR network)",
+                "{query} AND (molecular OR cellular OR biological)",
+                "{query} AND (function OR role OR activity)"
+            ],
+            QueryType.COMPLEX: [
+                "{query}",  # 复合查询直接使用原始查询
+                '"{query}" AND review[Publication Type]',
+                "{query} AND recent[Filter]"
+            ]
+        }
     
-    async def search_literature(self, gene: str, max_results: int = 500) -> List[LiteratureDocument]:
-        """检索文献"""
+    async def search_literature(self, search_query: Union[str, SearchQuery], max_results: int = 500) -> List[LiteratureDocument]:
+        """
+        检索文献 - 支持多种查询类型
         
-        print(f"📚 检索 {gene} 相关文献，目标: {max_results} 篇")
+        Args:
+            search_query: 查询字符串或SearchQuery对象
+            max_results: 最大结果数
         
-        # 多策略搜索
-        search_strategies = [
-            f"{gene}[Title/Abstract]",
-            f'"{gene}" AND (disease OR treatment OR therapy)',
-            f"{gene} AND (clinical trial[Publication Type] OR clinical study[Publication Type])",
-            f"{gene} AND (mechanism OR pathway OR function)",
-            f"{gene} AND (drug OR inhibitor OR target OR therapeutic)"
-        ]
+        Returns:
+            文献文档列表
+        """
+        
+        # 处理输入参数
+        if isinstance(search_query, str):
+            # 兼容原有接口：字符串查询默认为基因查询
+            query = SearchQuery(
+                query_text=search_query,
+                query_type=QueryType.GENE,
+                max_results=max_results
+            )
+        else:
+            query = search_query
+            max_results = query.max_results
+        
+        print(f"📚 检索文献: {query.query_text} ({query.query_type.value})")
+        print(f"   目标: {max_results} 篇")
+        
+        # 构建搜索策略
+        search_strategies = self._build_search_strategies(query)
         
         all_documents = []
         seen_pmids = set()
@@ -136,6 +217,41 @@ class PubMedRetriever:
         
         print(f"📊 检索完成: 共 {len(all_documents)} 篇文献")
         return all_documents[:max_results]
+    
+    def _build_search_strategies(self, query: SearchQuery) -> List[str]:
+        """构建搜索策略"""
+        
+        base_strategies = self.search_templates.get(query.query_type, self.search_templates[QueryType.KEYWORD])
+        strategies = []
+        
+        # 基础查询策略
+        for template in base_strategies:
+            strategy = template.format(query=query.query_text)
+            strategies.append(strategy)
+        
+        # 添加附加术语
+        if query.additional_terms:
+            additional_query = f"({query.query_text}) AND ({' OR '.join(query.additional_terms)})"
+            strategies.append(additional_query)
+        
+        # 处理排除术语
+        if query.exclude_terms:
+            exclude_part = " AND ".join([f"NOT {term}" for term in query.exclude_terms])
+            enhanced_strategies = []
+            for strategy in strategies[:2]:  # 只对前两个策略应用排除
+                enhanced_strategies.append(f"{strategy} {exclude_part}")
+            strategies.extend(enhanced_strategies)
+        
+        # 日期范围过滤
+        if query.date_range:
+            start_year, end_year = query.date_range
+            date_filter = f" AND {start_year}[PDAT]:{end_year}[PDAT]"
+            dated_strategies = []
+            for strategy in strategies[:3]:  # 对前三个策略应用日期过滤
+                dated_strategies.append(f"{strategy}{date_filter}")
+            strategies.extend(dated_strategies)
+        
+        return strategies
     
     async def _execute_search(self, query: str, max_results: int) -> List[LiteratureDocument]:
         """执行单次搜索"""
@@ -593,12 +709,48 @@ class RAGProcessor:
 # ===== 缓存管理器 =====
 
 class CacheManager:
-    """缓存管理器"""
+    """增强的缓存管理器"""
     
-    def __init__(self, cache_dir: str = "literature_cache"):
+    def __init__(self, cache_dir: str = "enhanced_literature_cache"):
         self.cache_dir = cache_dir
+        self.cache_days = 7  # 缓存有效期
         os.makedirs(cache_dir, exist_ok=True)
     
+    def load_by_key(self, cache_key: str) -> Optional[VectorStore]:
+        """根据缓存键加载"""
+        
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.pkl")
+        
+        if not os.path.exists(cache_file):
+            return None
+        
+        try:
+            # 检查缓存时效
+            mod_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
+            if datetime.now() - mod_time > timedelta(days=self.cache_days):
+                return None
+            
+            with open(cache_file, 'rb') as f:
+                vector_store = pickle.load(f)
+                print(f"📂 从缓存加载: {cache_key}")
+                return vector_store
+                
+        except Exception as e:
+            print(f"❌ 缓存加载失败: {e}")
+            return None
+    
+    def save_by_key(self, cache_key: str, vector_store: VectorStore):
+        """根据缓存键保存"""
+        
+        try:
+            cache_file = os.path.join(self.cache_dir, f"{cache_key}.pkl")
+            with open(cache_file, 'wb') as f:
+                pickle.dump(vector_store, f)
+            print(f"💾 缓存已保存: {cache_key}")
+        except Exception as e:
+            print(f"❌ 缓存保存失败: {e}")
+    
+    # 兼容原有接口
     def get_cache_path(self, gene: str, max_results: int) -> str:
         """获取缓存路径"""
         cache_key = f"{gene}_{max_results}"
@@ -613,31 +765,24 @@ class CacheManager:
         return datetime.now() - file_time < timedelta(days=max_age_days)
     
     def save(self, gene: str, max_results: int, vector_store: VectorStore):
-        """保存缓存"""
-        cache_path = self.get_cache_path(gene, max_results)
-        vector_store.save(cache_path)
+        """兼容原有save方法"""
+        cache_key = f"{gene}_{max_results}"
+        self.save_by_key(cache_key, vector_store)
     
     def load(self, gene: str, max_results: int) -> Optional[VectorStore]:
-        """加载缓存"""
-        cache_path = self.get_cache_path(gene, max_results)
-        
-        if self.is_valid(cache_path):
-            vector_store = VectorStore()
-            if vector_store.load(cache_path):
-                print(f"📂 从缓存加载: {gene}")
-                return vector_store
-        
-        return None
+        """兼容原有load方法"""
+        cache_key = f"{gene}_{max_results}"
+        return self.load_by_key(cache_key)
 
 # ===== 主要的Literature Expert =====
 
 class LiteratureExpert:
-    """文献分析专家 - 基于RAG优化"""
+    """文献分析专家 - 基于RAG优化，支持多种查询类型"""
     
     def __init__(self, config: AnalysisConfig = None):
-        self.name = "Literature Expert"
-        self.version = "2.0.0"
-        self.expertise = ["文献分析", "机制研究", "治疗策略", "靶点分析"]
+        self.name = "Enhanced Literature Expert"
+        self.version = "3.0.0"
+        self.expertise = ["多类型查询", "文献分析", "机制研究", "治疗策略", "靶点分析"]
         
         # 配置
         self.config = config or ConfigManager.get_standard_config()
@@ -661,7 +806,7 @@ class LiteratureExpert:
     
     async def analyze(self, gene_target: str, context: Dict[str, Any] = None) -> LiteratureAnalysisResult:
         """
-        主要分析方法
+        主要分析方法（基因名查询）
         
         Args:
             gene_target: 目标基因
@@ -671,73 +816,167 @@ class LiteratureExpert:
             文献分析结果
         """
         
-        logger.info(f"开始文献分析: {gene_target} - 模式: {self.config.mode.value}")
+        return await self.analyze_by_gene(gene_target, context)
+    
+    async def analyze_by_gene(self, gene_target: str, context: Dict[str, Any] = None) -> LiteratureAnalysisResult:
+        """基因名分析"""
+        
+        query = SearchQuery(
+            query_text=gene_target,
+            query_type=QueryType.GENE,
+            max_results=self._get_max_literature()
+        )
+        
+        return await self.analyze_by_query(query, context)
+    
+    async def analyze_by_keyword(self, keyword: str, 
+                                additional_terms: List[str] = None,
+                                exclude_terms: List[str] = None,
+                                context: Dict[str, Any] = None) -> LiteratureAnalysisResult:
+        """关键词分析"""
+        
+        query = SearchQuery(
+            query_text=keyword,
+            query_type=QueryType.KEYWORD,
+            additional_terms=additional_terms or [],
+            exclude_terms=exclude_terms or [],
+            max_results=self._get_max_literature()
+        )
+        
+        return await self.analyze_by_query(query, context)
+    
+    async def analyze_protein_family(self, family_name: str,
+                                   additional_terms: List[str] = None,
+                                   context: Dict[str, Any] = None) -> LiteratureAnalysisResult:
+        """蛋白家族分析"""
+        
+        query = SearchQuery(
+            query_text=family_name,
+            query_type=QueryType.PROTEIN_FAMILY,
+            additional_terms=additional_terms or [],
+            max_results=self._get_max_literature()
+        )
+        
+        return await self.analyze_by_query(query, context)
+    
+    async def analyze_mechanism(self, mechanism_query: str,
+                              additional_terms: List[str] = None,
+                              context: Dict[str, Any] = None) -> LiteratureAnalysisResult:
+        """机制分析"""
+        
+        query = SearchQuery(
+            query_text=mechanism_query,
+            query_type=QueryType.MECHANISM,
+            additional_terms=additional_terms or [],
+            max_results=self._get_max_literature()
+        )
+        
+        return await self.analyze_by_query(query, context)
+    
+    async def analyze_by_query(self, search_query: SearchQuery, context: Dict[str, Any] = None) -> LiteratureAnalysisResult:
+        """
+        通用查询分析方法
+        
+        Args:
+            search_query: 搜索查询对象
+            context: 上下文配置
+        
+        Returns:
+            文献分析结果
+        """
+        
+        logger.info(f"开始文献分析: {search_query.query_text} ({search_query.query_type.value}) - 模式: {self.config.mode.value}")
         
         try:
             # 确定分析参数
-            max_literature = self._get_max_literature()
             top_k = self._get_top_k()
             
             # 1. 尝试从缓存加载
-            vector_store = self.cache_manager.load(gene_target, max_literature)
+            cache_key = self._generate_cache_key(search_query)
+            vector_store = self.cache_manager.load_by_key(cache_key)
             
             # 2. 如果缓存无效，重新构建
             if vector_store is None:
-                vector_store = await self._build_literature_index(gene_target, max_literature)
+                vector_store = await self._build_literature_index(search_query)
                 # 保存缓存
-                self.cache_manager.save(gene_target, max_literature, vector_store)
+                self.cache_manager.save_by_key(cache_key, vector_store)
             
             # 3. RAG查询处理
             rag_processor = RAGProcessor(vector_store)
             
             print("🤖 开始RAG查询...")
             
-            # 并发处理三个查询
+            # 根据查询类型调整RAG查询
+            rag_queries = self._get_rag_queries(search_query)
+            
+            # 并发处理查询
             tasks = [
-                rag_processor.process_query(gene_target, "disease_mechanism", top_k),
-                rag_processor.process_query(gene_target, "treatment_strategy", top_k),
-                rag_processor.process_query(gene_target, "target_analysis", top_k)
+                rag_processor.process_query(search_query.query_text, query_type, top_k)
+                for query_type in rag_queries
             ]
             
             results = await asyncio.gather(*tasks)
-            disease_result, treatment_result, target_result = results
             
             # 4. 构建分析结果
             references = self._extract_references(vector_store.chunks)
             confidence_score = self._calculate_confidence(vector_store.chunks)
             
+            # 根据查询类型组织结果
+            result_dict = {}
+            for i, query_type in enumerate(rag_queries):
+                result_dict[query_type] = results[i] if i < len(results) else ""
+            
             analysis_result = LiteratureAnalysisResult(
-                gene_target=gene_target,
-                disease_mechanism=disease_result,
-                treatment_strategy=treatment_result,
-                target_analysis=target_result,
+                gene_target=search_query.query_text,  # 保持兼容性
+                disease_mechanism=result_dict.get("disease_mechanism", ""),
+                treatment_strategy=result_dict.get("treatment_strategy", ""),
+                target_analysis=result_dict.get("target_analysis", ""),
                 references=references[:50],  # 限制引用数量
                 total_literature=len(set(chunk.doc_id for chunk in vector_store.chunks)),
                 total_chunks=len(vector_store.chunks),
                 confidence_score=confidence_score,
-                analysis_method="RAG-optimized",
+                analysis_method=f"Enhanced-RAG-{search_query.query_type.value}",
                 timestamp=datetime.now().isoformat(),
                 config_used=self._get_config_summary(),
                 token_usage=self._estimate_token_usage(top_k)
             )
             
-            logger.info(f"文献分析完成: {gene_target} - 文献数: {analysis_result.total_literature}")
+            logger.info(f"文献分析完成: {search_query.query_text} - 文献数: {analysis_result.total_literature}")
             return analysis_result
             
         except Exception as e:
-            logger.error(f"文献分析失败: {gene_target} - {str(e)}")
-            return self._create_error_result(gene_target, str(e))
+            logger.error(f"文献分析失败: {search_query.query_text} - {str(e)}")
+            return self._create_error_result(search_query.query_text, str(e))
     
-    async def _build_literature_index(self, gene: str, max_results: int) -> VectorStore:
+    def _get_rag_queries(self, search_query: SearchQuery) -> List[str]:
+        """根据查询类型获取RAG查询类型"""
+        
+        # 所有查询类型都使用标准的三个分析维度
+        return ["disease_mechanism", "treatment_strategy", "target_analysis"]
+    
+    def _generate_cache_key(self, search_query: SearchQuery) -> str:
+        """生成缓存键"""
+        
+        query_str = f"{search_query.query_text}_{search_query.query_type.value}"
+        if search_query.additional_terms:
+            query_str += f"_add_{','.join(search_query.additional_terms)}"
+        if search_query.exclude_terms:
+            query_str += f"_exc_{','.join(search_query.exclude_terms)}"
+        if search_query.date_range:
+            query_str += f"_date_{search_query.date_range[0]}_{search_query.date_range[1]}"
+        
+        return hashlib.md5(query_str.encode()).hexdigest()
+    
+    async def _build_literature_index(self, search_query: SearchQuery) -> VectorStore:
         """构建文献索引"""
         
-        print(f"🏗️ 构建文献索引: {gene}")
+        print(f"🏗️ 构建文献索引: {search_query.query_text} ({search_query.query_type.value})")
         
         # 1. 检索文献
-        documents = await self.retriever.search_literature(gene, max_results)
+        documents = await self.retriever.search_literature(search_query)
         
         if not documents:
-            raise ValueError(f"未找到 {gene} 相关文献")
+            raise ValueError(f"未找到 {search_query.query_text} 相关文献")
         
         # 2. 文本分块
         chunks = self.chunker.chunk_documents(documents)
@@ -880,9 +1119,9 @@ class LiteratureExpert:
 # ===== 使用示例 =====
 
 async def example_usage():
-    """使用示例"""
+    """使用示例 - 展示多种查询功能"""
     
-    print("🧬 Literature Expert 使用示例")
+    print("🧬 Enhanced Literature Expert 使用示例")
     print("=" * 60)
     
     # 1. 创建Literature Expert
@@ -892,17 +1131,30 @@ async def example_usage():
     print(f"📚 {expert.name} v{expert.version} 已启动")
     print(f"专业领域: {', '.join(expert.expertise)}")
     
-    # 2. 成本估算
-    cost = expert.estimate_analysis_cost("PCSK9")
-    print(f"\n💰 分析成本估算:")
-    print(f"  预估Token: {cost['estimated_tokens']}")
-    print(f"  预估成本: ${cost['estimated_cost_usd']:.4f}")
-    print(f"  预估时间: {cost['estimated_time_seconds']}秒")
-    print(f"  最大文献数: {cost['max_literature']}")
+    # 2. 基因名查询示例
+    print(f"\n🧪 示例1: 基因名查询 - PCSK9")
+    result1 = await expert.analyze("PCSK9")
+    print(f"✅ 结果: {result1.total_literature} 篇文献")
     
-    # 3. 执行分析
-    print(f"\n🔬 开始分析 PCSK9...")
-    result = await expert.analyze("PCSK9")
+    # 3. 关键词查询示例  
+    print(f"\n🧪 示例2: 关键词查询 - KRAB-like proteins")
+    result2 = await expert.analyze_by_keyword(
+        keyword="KRAB-like proteins",
+        additional_terms=["epigenetic", "transcriptional regulation", "zinc finger"],
+        exclude_terms=["virus", "bacterial"]
+    )
+    print(f"✅ 结果: {result2.total_literature} 篇文献")
+    
+    # 4. 蛋白家族查询示例
+    print(f"\n🧪 示例3: 蛋白家族查询 - BTB domain proteins")
+    result3 = await expert.analyze_protein_family(
+        family_name="BTB domain proteins",
+        additional_terms=["transcriptional repressor", "chromatin modification"]
+    )
+    print(f"✅ 结果: {result3.total_literature} 篇文献")
+    
+    # 5. 选择一个结果详细展示
+    result = result2  # 使用KRAB-like查询结果
     
     # 4. 显示结果
     print(f"\n📊 分析结果:")
